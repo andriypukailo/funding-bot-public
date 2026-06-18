@@ -6,6 +6,167 @@ import TelegramBot from "node-telegram-bot-api";
 import express from "express";
 import { CONFIG } from "./config.js";
 
+// ── HTML живого дашборда (вантажиться у браузері, сам тягне /api/data) ──
+const DASHBOARD_HTML = `<!doctype html>
+<html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FundingHunter</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0a0e17;color:#cbd5e1;font-family:'Inter','Segoe UI',system-ui,sans-serif}
+  header{padding:14px 22px;border-bottom:1px solid #16202e;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;position:sticky;top:0;background:#0a0e17ee;backdrop-filter:blur(8px);z-index:10}
+  .brand{display:flex;align-items:center;gap:11px}
+  .mark{width:34px;height:34px;border-radius:9px;background:radial-gradient(circle at 30% 30%,#fde047,#f59e0b 70%);display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 0 18px #f59e0b55}
+  .bt{font-size:17px;font-weight:800;color:#f8fafc}
+  .sub{font-size:11px;color:#475569}
+  .wrap{padding:18px 22px 60px;max-width:1320px;margin:0 auto}
+  .legend{margin-bottom:14px;padding:10px 14px;background:#0b1320;border:1px solid #16202e;border-radius:10px;font-size:12px;color:#94a3b8;line-height:1.6}
+  .legend b{color:#cbd5e1}
+  .stats{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+  .stat{flex:1 1 130px;background:#0e1521;border:1px solid #16202e;border-radius:12px;padding:12px 14px}
+  .stat .l{font-size:11px;color:#64748b;font-weight:600;margin-bottom:4px}
+  .stat .v{font-size:21px;font-weight:800}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;font-size:12px}
+  .toolbar label{color:#64748b}
+  .toolbar input{background:#070b12;border:1px solid #243042;border-radius:7px;color:#e2e8f0;padding:5px 9px;font-size:12px;width:90px}
+  .toolbar button{background:#16202e;border:1px solid #243042;border-radius:7px;color:#cbd5e1;padding:5px 12px;font-size:12px;cursor:pointer}
+  table{width:100%;border-collapse:collapse}
+  th{padding:9px 11px;font-size:10.5px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.05em;text-align:right;white-space:nowrap;border-bottom:1px solid #16202e}
+  th.l,td.l{text-align:left}
+  td{padding:8px 11px;font-size:12.5px;text-align:right;border-bottom:1px solid #111a26;font-variant-numeric:tabular-nums}
+  tr.sig{background:#1c1605}
+  .pill{font-size:10px;padding:1px 6px;border-radius:5px;background:#16202e;color:#94a3b8;margin-left:4px}
+  .muted{color:#475569}
+  .scroll{overflow-x:auto}
+</style></head>
+<body>
+<header>
+  <div class="brand"><div class="mark">◎</div>
+    <div><div class="bt">FundingHunter</div><div class="sub" id="sub">завантаження…</div></div></div>
+  <div style="display:flex;gap:12px;align-items:center">
+    <span class="sub" id="upd"></span>
+    <span id="sigcount" style="font-size:12px;font-weight:700;color:#475569">● 0 сигналів</span>
+  </div>
+</header>
+<div class="wrap">
+  <div class="legend">
+    Фандінг є <b>лише на фʼючерсах</b>. Дельта-нейтрально: позиція на фʼючерсах + рівна протилежна на споті тієї ж біржі.
+    <span style="color:#fb7185">Додатній → шорт фʼючерс + купити спот.</span>
+    <span style="color:#4ade80">Відʼємний → лонг фʼючерс + шорт спот.</span>
+    Жовте = сигнал (до виплати ≤ <span id="win">30</span> хв).
+  </div>
+  <div class="stats" id="stats"></div>
+  <div class="toolbar">
+    <label>Чистий від %<input id="fMin" type="number" step="0.1" value="1"></label>
+    <label>до %<input id="fMax" type="number" step="0.1" value="4"></label>
+    <label>Макс. ціна 24г %<input id="fPrice" type="number" step="0.5" value="5"></label>
+    <label><input id="fBoth" type="checkbox" checked style="width:auto"> лише спот+фʼючерс</label>
+    <button onclick="applyClient()">Застосувати</button>
+    <button onclick="resetClient()">Скинути</button>
+    <span class="muted" id="count"></span>
+  </div>
+  <div class="scroll">
+    <table>
+      <thead><tr>
+        <th class="l">Актив</th><th class="l">Біржа</th><th>Ціна</th>
+        <th>Фандінг</th><th style="color:#fbbf24">Чистий</th>
+        <th class="l">Як торгувати</th><th>Інт.</th><th>До виплати</th>
+        <th>Ціна 24г</th><th>Обсяг</th><th>OI</th>
+      </tr></thead>
+      <tbody id="tb"></tbody>
+    </table>
+  </div>
+</div>
+<script>
+let CFG=null, RAW=[];
+const fmtUsd=n=>n==null?'—':n>=1e9?'$'+(n/1e9).toFixed(2)+'B':n>=1e6?'$'+(n/1e6).toFixed(1)+'M':n>=1e3?'$'+(n/1e3).toFixed(0)+'K':'$'+n.toFixed(0);
+const fmtPct=n=>n==null?'—':(n>=0?'+':'')+n.toFixed(3)+'%';
+const fmtPrice=n=>n==null?'—':n>=1000?'$'+n.toLocaleString('en-US',{maximumFractionDigits:1}):n>=1?'$'+n.toFixed(3):'$'+n.toFixed(6);
+const fmtMins=m=>{if(m==null)return'—';m=Math.floor(m);return m<0?'—':m<60?m+'хв':Math.floor(m/60)+'г '+(m%60)+'хв';};
+const fc=f=>f>=0?'#fb7185':'#4ade80';
+function plan(r){return r.funding>=0
+  ?{f:'📉 Шорт фʼючерс ('+r.ex+')',s:'📈 Купити спот ('+r.ex+')'}
+  :{f:'📈 Лонг фʼючерс ('+r.ex+')',s:'📉 Шорт спот ('+r.ex+')'};}
+
+async function load(){
+  try{
+    const d=await (await fetch('/api/data')).json();
+    CFG=d.config; RAW=d.rows;
+    document.getElementById('sub').textContent=RAW.length+' котирувань · '+new Set(RAW.map(r=>r.ex)).size+' бірж';
+    document.getElementById('upd').textContent='оновлено '+new Date(d.updated).toLocaleTimeString('uk-UA');
+    document.getElementById('win').textContent=CFG.window;
+    // ініціалізація фільтрів значеннями з бекенда (один раз)
+    if(!window._init){window._init=1;
+      document.getElementById('fMin').value=CFG.minNet;
+      document.getElementById('fMax').value=CFG.maxNet;
+      document.getElementById('fPrice').value=CFG.maxPrice;
+      document.getElementById('fBoth').checked=CFG.requireBoth;
+    }
+    render();
+  }catch(e){document.getElementById('sub').textContent='помилка завантаження даних';}
+}
+function getF(){return{
+  min:parseFloat(document.getElementById('fMin').value),
+  max:parseFloat(document.getElementById('fMax').value),
+  price:parseFloat(document.getElementById('fPrice').value),
+  both:document.getElementById('fBoth').checked,
+};}
+function applyClient(){render();}
+function resetClient(){
+  document.getElementById('fMin').value=CFG.minNet;
+  document.getElementById('fMax').value=CFG.maxNet;
+  document.getElementById('fPrice').value=CFG.maxPrice;
+  document.getElementById('fBoth').checked=CFG.requireBoth;
+  render();
+}
+function render(){
+  const f=getF();
+  let rows=RAW.filter(r=>{
+    if(r.net<f.min||r.net>f.max)return false;
+    if(r.priceChange24h!=null&&Math.abs(r.priceChange24h)>f.price)return false;
+    if(r.volume24h!=null&&CFG.minVol&&r.volume24h<CFG.minVol)return false;
+    if(r.oi!=null&&CFG.minOi&&r.oi<CFG.minOi)return false;
+    if(f.both&&!(r.hasSpot&&r.hasFutures))return false;
+    return true;
+  });
+  const sig=r=>r.mins!=null&&r.mins>=0&&r.mins<=CFG.window;
+  rows.sort((a,b)=>{const sa=sig(a),sb=sig(b);if(sa!==sb)return sa?-1:1;if(sa&&sb)return a.mins-b.mins;return b.net-a.net;});
+  const sc=rows.filter(sig).length;
+  document.getElementById('sigcount').textContent='● '+sc+' сигналів';
+  document.getElementById('sigcount').style.color=sc?'#fde047':'#475569';
+  document.getElementById('count').textContent=rows.length+' пар проходять фільтри';
+  // статистика
+  const all=RAW.map(r=>r.funding);
+  const stats=[
+    ['Котирувань',RAW.length,'#6366f1'],
+    ['Проходять фільтр',rows.length,'#22d3ee'],
+    ['Сигналів зараз',sc,'#fde047'],
+    ['Макс. чистий',rows.length?fmtPct(Math.max(...rows.map(r=>r.net))):'—','#fbbf24'],
+  ];
+  document.getElementById('stats').innerHTML=stats.map(s=>
+    '<div class="stat"><div class="l">'+s[0]+'</div><div class="v" style="color:'+s[2]+'">'+s[1]+'</div></div>').join('');
+  // таблиця
+  document.getElementById('tb').innerHTML=rows.slice(0,120).map(r=>{
+    const p=plan(r),s=sig(r);
+    return '<tr class="'+(s?'sig':'')+'">'+
+      '<td class="l" style="font-weight:700;color:#f1f5f9">'+(s?'🎯 ':'')+r.sym+'</td>'+
+      '<td class="l" style="font-weight:700;color:#e2e8f0">'+r.ex+
+        (r.hasSpot&&r.hasFutures?'<span class="pill">S+F</span>':'')+'</td>'+
+      '<td style="color:#e2e8f0;font-weight:600">'+fmtPrice(r.price)+'</td>'+
+      '<td style="font-weight:700;color:'+fc(r.funding)+'">'+fmtPct(r.funding)+'</td>'+
+      '<td style="font-weight:800;color:'+(r.net>0?'#fbbf24':'#64748b')+'">'+fmtPct(r.net)+'</td>'+
+      '<td class="l" style="font-size:11px"><div style="color:'+fc(r.funding)+';font-weight:700">'+p.f+'</div><div class="muted">'+p.s+'</div></td>'+
+      '<td class="muted">'+(r.interval?r.interval+'г':'—')+'</td>'+
+      '<td style="color:'+(s?'#fde047':'#94a3b8')+';font-weight:'+(s?'700':'400')+'">'+fmtMins(r.mins)+'</td>'+
+      '<td style="color:'+((r.priceChange24h??0)>=0?'#86efac':'#fca5a5')+'">'+fmtPct(r.priceChange24h)+'</td>'+
+      '<td>'+fmtUsd(r.volume24h)+'</td>'+
+      '<td>'+fmtUsd(r.oi)+'</td></tr>';
+  }).join('')||'<tr><td colspan="11" style="text-align:center;padding:40px;color:#475569">Немає пар за фільтрами — послабте критерії вгорі</td></tr>';
+}
+load(); setInterval(load,10000);
+</script>
+</body></html>`;
+
 // ── Сховище даних у памʼяті ───────────────────────────────────────────
 // markets[exchange][symbol] = { funding, price, priceChange24h, volume24h, oi, interval, nextFundingTs, hasSpot, hasFutures }
 const markets = {};
@@ -409,21 +570,49 @@ setInterval(() => { applyMeta(); checkSignals(); }, CONFIG.CHECK_INTERVAL_MS);
 // Раз на 12 годин освіжаємо метадані (нові лістинги, зміни інтервалів)
 setInterval(() => { loadAllMeta(); }, 12 * 3600 * 1000);
 
-// Маленька веб-сторінка щоб бачити що бот живий + останні дані
+// ── Веб: JSON-дані + гарний живий дашборд ─────────────────────────────
 const app = express();
-app.get("/", (_req, res) => {
+
+// API: віддає всі котирування у JSON (сторінка сама їх малює й оновлює)
+app.get("/api/data", (_req, res) => {
+  const now = Date.now();
   const rows = [];
-  for (const ex of CONFIG.EXCHANGES)
-    for (const [sym, m] of Object.entries(markets[ex]))
-      if (m.funding != null) rows.push({ ex, sym, ...m, net: netProfit(m.funding).toFixed(3) });
-  rows.sort((a, b) => Math.abs(b.funding) - Math.abs(a.funding));
-  res.send(`<h2>✅ FundingHunter Bot працює</h2>
-    <p>Активних котирувань: ${rows.length}</p>
-    <table border=1 cellpadding=4><tr><th>Біржа</th><th>Актив</th><th>Фандінг%</th><th>Чистий%</th><th>Ціна</th><th>Зміна24г%</th></tr>
-    ${rows.slice(0, 50).map((r) => `<tr><td>${r.ex}</td><td>${r.sym}</td><td>${r.funding?.toFixed(3)}</td><td>${r.net}</td><td>${r.price}</td><td>${(r.priceChange24h ?? 0).toFixed(2)}</td></tr>`).join("")}
-    </table>`);
+  for (const ex of CONFIG.EXCHANGES) {
+    for (const [sym, m] of Object.entries(markets[ex])) {
+      if (m.funding == null || m.price == null) continue;
+      const net = netProfit(m.funding);
+      const mins = m.nextFundingTs ? (m.nextFundingTs - now) / 60000 : null;
+      rows.push({
+        ex, sym,
+        funding: m.funding,
+        net,
+        price: m.price,
+        priceChange24h: m.priceChange24h ?? null,
+        volume24h: m.volume24h ?? null,
+        oi: m.oi ?? null,
+        interval: m.interval ?? null,
+        mins,
+        hasSpot: !!m.hasSpot,
+        hasFutures: !!m.hasFutures,
+      });
+    }
+  }
+  res.json({
+    ok: true,
+    updated: now,
+    config: {
+      minNet: CONFIG.MIN_NET_PROFIT, maxNet: CONFIG.MAX_NET_PROFIT,
+      maxPrice: CONFIG.MAX_PRICE_CHANGE_24H, minVol: CONFIG.MIN_VOLUME_24H,
+      minOi: CONFIG.MIN_OI, window: CONFIG.SIGNAL_WINDOW_MIN,
+      requireBoth: CONFIG.REQUIRE_SPOT_AND_FUTURES,
+    },
+    rows,
+  });
 });
-app.listen(CONFIG.PORT, () => console.log(`🌐 Статус-сторінка на порту ${CONFIG.PORT}`));
+
+app.get("/", (_req, res) => res.send(DASHBOARD_HTML));
+app.listen(CONFIG.PORT, () => console.log(`🌐 Дашборд на порту ${CONFIG.PORT}`));
 
 // Привітальне повідомлення при старті
 if (bot) sendSignal("🚀 FundingHunter запущено! Шукаю можливості фандінгу...");
+
