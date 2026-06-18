@@ -54,22 +54,24 @@ const DASHBOARD_HTML = `<!doctype html>
     <span style="color:#fb7185">Додатній → шорт фʼючерс + купити спот.</span>
     <span style="color:#4ade80">Відʼємний → лонг фʼючерс + шорт спот.</span>
     Жовте = сигнал (до виплати ≤ <span id="win">30</span> хв).
+    <span class="pill" style="color:#fbbf24">🔀 крос</span> = спот на іншій біржі. Нетто = фандінг − комісії (БЕЗ крос-витрати); крос-витрата <span id="cc">0.1</span>% показана окремою колонкою.
   </div>
   <div class="stats" id="stats"></div>
   <div class="toolbar">
-    <label>Чистий від %<input id="fMin" type="number" step="0.1" value="1"></label>
+    <label>Чистий від %<input id="fMin" type="number" step="0.1" value="0.3"></label>
     <label>до %<input id="fMax" type="number" step="0.1" value="4"></label>
     <label>Макс. ціна 24г %<input id="fPrice" type="number" step="0.5" value="5"></label>
-    <label><input id="fBoth" type="checkbox" checked style="width:auto"> лише спот+фʼючерс</label>
+    <label><input id="fBoth" type="checkbox" checked style="width:auto"> є спот+фʼючерс (крос-біржово)</label>
     <button onclick="applyClient()">Застосувати</button>
     <button onclick="resetClient()">Скинути</button>
+    <button id="allBtn" onclick="toggleAll()">Показати всі</button>
     <span class="muted" id="count"></span>
   </div>
   <div class="scroll">
     <table>
       <thead><tr>
         <th class="l">Актив</th><th class="l">Біржа</th><th>Ціна</th>
-        <th>Фандінг</th><th style="color:#fbbf24">Чистий</th>
+        <th>Фандінг</th><th style="color:#fbbf24">Нетто</th><th style="color:#94a3b8">Крос-витр.</th>
         <th class="l">Як торгувати</th><th>Інт.</th><th>До виплати</th>
         <th>Ціна 24г</th><th>Обсяг</th><th>OI</th>
       </tr></thead>
@@ -78,15 +80,28 @@ const DASHBOARD_HTML = `<!doctype html>
   </div>
 </div>
 <script>
-let CFG=null, RAW=[];
+let CFG=null, RAW=[], SHOW_ALL=false;
 const fmtUsd=n=>n==null?'—':n>=1e9?'$'+(n/1e9).toFixed(2)+'B':n>=1e6?'$'+(n/1e6).toFixed(1)+'M':n>=1e3?'$'+(n/1e3).toFixed(0)+'K':'$'+n.toFixed(0);
 const fmtPct=n=>n==null?'—':(n>=0?'+':'')+n.toFixed(3)+'%';
 const fmtPrice=n=>n==null?'—':n>=1000?'$'+n.toLocaleString('en-US',{maximumFractionDigits:1}):n>=1?'$'+n.toFixed(3):'$'+n.toFixed(6);
 const fmtMins=m=>{if(m==null)return'—';m=Math.floor(m);return m<0?'—':m<60?m+'хв':Math.floor(m/60)+'г '+(m%60)+'хв';};
 const fc=f=>f>=0?'#fb7185':'#4ade80';
-function plan(r){return r.funding>=0
-  ?{f:'📉 Шорт фʼючерс ('+r.ex+')',s:'📈 Купити спот ('+r.ex+')'}
-  :{f:'📈 Лонг фʼючерс ('+r.ex+')',s:'📉 Шорт спот ('+r.ex+')'};}
+function plan(r){
+  const venues=(r.spotVenues||[]).filter(v=>v!==r.ex);
+  const sameSpot=r.hasSpot;
+  if(r.funding>=0){
+    let s='📈 Купити спот';
+    if(sameSpot){s+=' ('+r.ex+')';if(venues.length)s+=' / '+venues.join(', ');}
+    else if(venues.length){s+=': '+venues.join(', ');}
+    else{s+=' (немає)';}
+    return{f:'📉 Шорт фʼючерс ('+r.ex+')',s};
+  }
+  let s='📉 Шорт спот';
+  if(sameSpot){s+=' ('+r.ex+')';if(venues.length)s+=' / '+venues.join(', ');}
+  else if(venues.length){s+=': '+venues.join(', ');}
+  else{s+=' (немає)';}
+  return{f:'📈 Лонг фʼючерс ('+r.ex+')',s};
+}
 
 async function load(){
   try{
@@ -95,6 +110,7 @@ async function load(){
     document.getElementById('sub').textContent=RAW.length+' котирувань · '+new Set(RAW.map(r=>r.ex)).size+' бірж';
     document.getElementById('upd').textContent='оновлено '+new Date(d.updated).toLocaleTimeString('uk-UA');
     document.getElementById('win').textContent=CFG.window;
+    if(CFG.crossCost!=null)document.getElementById('cc').textContent=CFG.crossCost;
     // ініціалізація фільтрів значеннями з бекенда (один раз)
     if(!window._init){window._init=1;
       document.getElementById('fMin').value=CFG.minNet;
@@ -112,7 +128,16 @@ function getF(){return{
   both:document.getElementById('fBoth').checked,
 };}
 function applyClient(){render();}
+function toggleAll(){
+  SHOW_ALL=!SHOW_ALL;
+  document.getElementById('allBtn').textContent=SHOW_ALL?'Лише за фільтром':'Показати всі';
+  document.getElementById('allBtn').style.background=SHOW_ALL?'#f59e0b22':'#16202e';
+  render();
+}
 function resetClient(){
+  SHOW_ALL=false;
+  document.getElementById('allBtn').textContent='Показати всі';
+  document.getElementById('allBtn').style.background='#16202e';
   document.getElementById('fMin').value=CFG.minNet;
   document.getElementById('fMax').value=CFG.maxNet;
   document.getElementById('fPrice').value=CFG.maxPrice;
@@ -122,13 +147,22 @@ function resetClient(){
 function render(){
   const f=getF();
   let rows=RAW.filter(r=>{
-    if(r.net<f.min||r.net>f.max)return false;
-    if(r.priceChange24h!=null&&Math.abs(r.priceChange24h)>f.price)return false;
-    if(r.volume24h!=null&&CFG.minVol&&r.volume24h<CFG.minVol)return false;
-    if(r.oi!=null&&CFG.minOi&&r.oi<CFG.minOi)return false;
-    if(f.both&&!(r.hasSpot&&r.hasFutures))return false;
+    if(!SHOW_ALL){
+      if(r.net<f.min||r.net>f.max)return false;
+      if(r.priceChange24h!=null&&Math.abs(r.priceChange24h)>f.price)return false;
+      if(r.volume24h!=null&&CFG.minVol&&r.volume24h<CFG.minVol)return false;
+      if(r.oi!=null&&CFG.minOi&&r.oi<CFG.minOi)return false;
+    }
+    if(f.both){
+      if(!r.hasFutures)return false;
+      const spotAnywhere=(r.spotVenues||[]).length>0;
+      if(CFG.cross){ if(!spotAnywhere)return false; }
+      else { if(!r.hasSpot)return false; }
+    }
     return true;
   });
+  // ВАЖЛИВО: вікно часу тут НЕ фільтрує — лише підсвічує (жовтим).
+  // Сигнал у Telegram (з умовою ≤ вікно хв) обробляється окремо на бекенді.
   const sig=r=>r.mins!=null&&r.mins>=0&&r.mins<=CFG.window;
   rows.sort((a,b)=>{const sa=sig(a),sb=sig(b);if(sa!==sb)return sa?-1:1;if(sa&&sb)return a.mins-b.mins;return b.net-a.net;});
   const sc=rows.filter(sig).length;
@@ -151,17 +185,19 @@ function render(){
     return '<tr class="'+(s?'sig':'')+'">'+
       '<td class="l" style="font-weight:700;color:#f1f5f9">'+(s?'🎯 ':'')+r.sym+'</td>'+
       '<td class="l" style="font-weight:700;color:#e2e8f0">'+r.ex+
-        (r.hasSpot&&r.hasFutures?'<span class="pill">S+F</span>':'')+'</td>'+
+        (r.cross?'<span class="pill" style="color:#fbbf24">🔀 крос</span>':
+         (r.hasSpot&&r.hasFutures?'<span class="pill">S+F</span>':''))+'</td>'+
       '<td style="color:#e2e8f0;font-weight:600">'+fmtPrice(r.price)+'</td>'+
       '<td style="font-weight:700;color:'+fc(r.funding)+'">'+fmtPct(r.funding)+'</td>'+
       '<td style="font-weight:800;color:'+(r.net>0?'#fbbf24':'#64748b')+'">'+fmtPct(r.net)+'</td>'+
+      '<td style="color:'+(r.cross?'#fbbf24':'#475569')+'">'+(r.cross?'−'+CFG.crossCost+'%':'—')+'</td>'+
       '<td class="l" style="font-size:11px"><div style="color:'+fc(r.funding)+';font-weight:700">'+p.f+'</div><div class="muted">'+p.s+'</div></td>'+
       '<td class="muted">'+(r.interval?r.interval+'г':'—')+'</td>'+
       '<td style="color:'+(s?'#fde047':'#94a3b8')+';font-weight:'+(s?'700':'400')+'">'+fmtMins(r.mins)+'</td>'+
       '<td style="color:'+((r.priceChange24h??0)>=0?'#86efac':'#fca5a5')+'">'+fmtPct(r.priceChange24h)+'</td>'+
       '<td>'+fmtUsd(r.volume24h)+'</td>'+
       '<td>'+fmtUsd(r.oi)+'</td></tr>';
-  }).join('')||'<tr><td colspan="11" style="text-align:center;padding:40px;color:#475569">Немає пар за фільтрами — послабте критерії вгорі</td></tr>';
+  }).join('')||'<tr><td colspan="12" style="text-align:center;padding:40px;color:#475569">Немає пар за фільтрами. Натисніть «Показати всі», щоб побачити геть усі котирування з бірж (екстремальний фандінг 1–4% буває нечасто).</td></tr>';
 }
 load(); setInterval(load,10000);
 </script>
@@ -218,6 +254,13 @@ async function sendSignal(text) {
 }
 
 // ── Допоміжні ─────────────────────────────────────────────────────────
+// Чи доведеться торгувати крос-біржово (спота немає на тій самій біржі, але є деінде)
+function isCross(symbol, futuresEx) {
+  if (spotSets[futuresEx].has(symbol)) return false; // спот тут — не крос
+  return spotVenues(symbol).length > 0;              // спот лише на іншій біржі
+}
+
+// Чистий прибуток (нетто) = |фандінг| − комісія×2. Крос-витрату НЕ віднімаємо тут.
 const netProfit = (funding) => Math.abs(funding) - CONFIG.FEE_PER_SIDE * 2;
 const minsToFunding = (ts) => (ts - Date.now()) / 60000;
 const fmtUsd = (n) => (n >= 1e9 ? "$" + (n / 1e9).toFixed(2) + "B"
@@ -231,6 +274,32 @@ function tradePlan(funding, exchange) {
   return `📈 Лонг фʼючерс (${exchange})\n📉 Шорт/продати спот (${exchange})`;
 }
 
+// Усі біржі, де ця монета є на споті (для крос-біржового хеджу)
+function spotVenues(symbol) {
+  const out = [];
+  for (const ex of CONFIG.EXCHANGES) if (spotSets[ex].has(symbol)) out.push(ex);
+  return out;
+}
+
+// Крос-біржовий план: фʼючерс на біржі сигналу, спот — на будь-якій зі spotVenues
+function crossPlan(funding, futuresEx, symbol) {
+  const venues = spotVenues(symbol).filter((v) => v !== futuresEx);
+  const sameHasSpot = spotSets[futuresEx].has(symbol);
+  const side = funding >= 0
+    ? { fut: `📉 Шорт фʼючерс (${futuresEx})`, spot: "📈 Купити спот" }
+    : { fut: `📈 Лонг фʼючерс (${futuresEx})`, spot: "📉 Шорт спот" };
+  let spotLine;
+  if (sameHasSpot) {
+    spotLine = `${side.spot} (${futuresEx} — та сама біржа, найпростіше)`;
+    if (venues.length) spotLine += `\n   або дешевше на: ${venues.join(", ")}`;
+  } else if (venues.length) {
+    spotLine = `${side.spot} на: ${venues.join(", ")} (крос-біржово)`;
+  } else {
+    spotLine = `${side.spot} (спот не знайдено — лише напрям фʼючерса)`;
+  }
+  return `${side.fut}\n${spotLine}`;
+}
+
 // ── Перевірка умов і розсилка ─────────────────────────────────────────
 function checkSignals() {
   const now = Date.now();
@@ -238,9 +307,16 @@ function checkSignals() {
     for (const [symbol, m] of Object.entries(markets[ex])) {
       if (!m || m.funding == null || m.price == null) continue;
 
-      // фільтр: спот + фʼючерс
-      if (CONFIG.REQUIRE_SPOT_AND_FUTURES && (!m.hasSpot || !m.hasFutures)) continue;
+      // фільтр: фʼючерс мусить бути; спот — або тут, або (крос-режим) на будь-якій біржі
+      if (CONFIG.REQUIRE_SPOT_AND_FUTURES) {
+        if (!m.hasFutures) continue;
+        const spotHere = m.hasSpot;
+        const spotAnywhere = spotVenues(symbol).length > 0;
+        if (CONFIG.ALLOW_CROSS_EXCHANGE) { if (!spotAnywhere) continue; }
+        else { if (!spotHere) continue; }
+      }
 
+      const cross = isCross(symbol, ex);
       const net = netProfit(m.funding);
       if (net < CONFIG.MIN_NET_PROFIT || net > CONFIG.MAX_NET_PROFIT) continue;
       if (Math.abs(m.priceChange24h ?? 0) > CONFIG.MAX_PRICE_CHANGE_24H) continue;
@@ -257,14 +333,15 @@ function checkSignals() {
       lastSent[key] = now;
 
       const msg =
-        `🎯 <b>${symbol}</b> на <b>${ex.toUpperCase()}</b>\n` +
-        `💰 Чистий прибуток: <b>${net >= 0 ? "+" : ""}${net.toFixed(3)}%</b>\n` +
+        `🎯 <b>${symbol}</b> на <b>${ex.toUpperCase()}</b>${cross ? " 🔀 крос-біржово" : ""}\n` +
+        `💰 Нетто (фандінг − комісії): <b>${net >= 0 ? "+" : ""}${net.toFixed(3)}%</b>\n` +
+        (cross ? `🔀 Крос-витрата (окремо): ~${CONFIG.CROSS_EXCHANGE_COST}% · орієнтовно після неї: ${(net - CONFIG.CROSS_EXCHANGE_COST).toFixed(3)}%\n` : "") +
         `📊 Фандінг: ${m.funding >= 0 ? "+" : ""}${m.funding.toFixed(3)}% (кожні ${m.interval}г)\n` +
         `💵 Ціна: $${m.price}\n` +
         `📈 Зміна 24г: ${(m.priceChange24h ?? 0).toFixed(2)}%\n` +
         `🔊 Обсяг: ${fmtUsd(m.volume24h)} · OI: ${fmtUsd(m.oi)}\n` +
         `⏱ Виплата через ~${Math.round(mins)} хв\n\n` +
-        `<b>Як торгувати:</b>\n${tradePlan(m.funding, ex)}`;
+        `<b>Як торгувати:</b>\n${crossPlan(m.funding, ex, symbol)}`;
 
       sendSignal(msg);
     }
@@ -580,12 +657,14 @@ app.get("/api/data", (_req, res) => {
   for (const ex of CONFIG.EXCHANGES) {
     for (const [sym, m] of Object.entries(markets[ex])) {
       if (m.funding == null || m.price == null) continue;
+      const cross = isCross(sym, ex);
       const net = netProfit(m.funding);
       const mins = m.nextFundingTs ? (m.nextFundingTs - now) / 60000 : null;
       rows.push({
         ex, sym,
         funding: m.funding,
         net,
+        cross,
         price: m.price,
         priceChange24h: m.priceChange24h ?? null,
         volume24h: m.volume24h ?? null,
@@ -594,6 +673,7 @@ app.get("/api/data", (_req, res) => {
         mins,
         hasSpot: !!m.hasSpot,
         hasFutures: !!m.hasFutures,
+        spotVenues: spotVenues(sym),
       });
     }
   }
@@ -605,6 +685,9 @@ app.get("/api/data", (_req, res) => {
       maxPrice: CONFIG.MAX_PRICE_CHANGE_24H, minVol: CONFIG.MIN_VOLUME_24H,
       minOi: CONFIG.MIN_OI, window: CONFIG.SIGNAL_WINDOW_MIN,
       requireBoth: CONFIG.REQUIRE_SPOT_AND_FUTURES,
+      cross: CONFIG.ALLOW_CROSS_EXCHANGE,
+      crossCost: CONFIG.CROSS_EXCHANGE_COST,
+      feePerSide: CONFIG.FEE_PER_SIDE,
     },
     rows,
   });
