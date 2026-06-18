@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════
 import WebSocket from "ws";
 import TelegramBot from "node-telegram-bot-api";
+import zlib from "zlib";
 import express from "express";
 import { CONFIG } from "./config.js";
 
@@ -472,13 +473,24 @@ function checkSignals() {
 //  Якщо звʼязок обірветься — автоматично перепідключається.
 // ═══════════════════════════════════════════════════════════════════
 function connect(name, url, onOpen, onMessage) {
-  let ws;
+  let ws, stopped = false;
   const open = () => {
+    if (stopped) return;
     ws = new WebSocket(url);
     ws.on("open", () => { console.log(`🔌 ${name}: підключено`); onOpen(ws); });
     ws.on("message", (data) => { try { onMessage(JSON.parse(data.toString())); } catch {} });
-    ws.on("close", () => { console.log(`🔁 ${name}: розрив, перепідключення за 5с`); setTimeout(open, 5000); });
-    ws.on("error", (e) => { console.log(`❌ ${name}: помилка ${e.message}`); ws.close(); });
+    ws.on("close", () => { if (!stopped) { console.log(`🔁 ${name}: розрив, перепідключення за 5с`); setTimeout(open, 5000); } });
+    ws.on("error", (e) => {
+      const msg = e.message || "";
+      // 451 = географічне блокування. Немає сенсу перепідключатись — лише спам у логах.
+      if (msg.includes("451")) {
+        stopped = true;
+        console.log(`⛔ ${name}: біржа блокує цей сервер за геолокацією (451). Потік вимкнено.`);
+      } else {
+        console.log(`❌ ${name}: помилка ${msg}`);
+      }
+      try { ws.close(); } catch {}
+    });
   };
   open();
   return () => ws;
@@ -533,6 +545,7 @@ function startBinance() {
     }
   );
   // СПОТ ціна + bid/ask (для basis і spot spread) — спотовий bookTicker
+  // (працює лише там, де Binance не блокує IP; на Railway Binance вимкнено в config)
   connect("Binance-spot", "wss://stream.binance.com:9443/ws/!bookTicker",
     () => {},
     (t) => {
@@ -666,6 +679,133 @@ function startGate() {
   );
 }
 
+// ── MEXC ──────────────────────────────────────────────────────────────
+function startMEXC() {
+  connect("MEXC", "wss://contract.mexc.com/edge",
+    (ws) => {
+      MEXC_SYMBOLS.forEach((s) => {
+        try { ws.send(JSON.stringify({ method: "sub.ticker", param: { symbol: `${s}_USDT` } })); } catch {}
+      });
+      setInterval(() => { try { ws.send(JSON.stringify({ method: "ping" })); } catch {} }, 15000);
+    },
+    (msg) => {
+      if (msg.channel === "push.ticker" && msg.data) {
+        const d = msg.data;
+        const symbol = (d.symbol || "").replace("_USDT", "");
+        setM("mexc", symbol, {
+          funding: parseFloat(d.fundingRate) * 100,
+          price: parseFloat(d.lastPrice),
+          priceChange24h: parseFloat(d.riseFallRate) * 100,
+          volume24h: parseFloat(d.amount24 || 0),
+          oi: parseFloat(d.holdVol || 0) * parseFloat(d.lastPrice || 0),
+          interval: 8, hasFutures: true,
+        });
+      }
+    }
+  );
+}
+
+// ── KUCOIN ────────────────────────────────────────────────────────────
+// KuCoin вимагає токен через REST перед WS-підключенням
+async function startKucoin() {
+  const tok = await getJson("https://api-futures.kucoin.com/api/v1/bullet-public", { method: "POST" });
+  if (!tok?.data?.token) { console.log("❌ KuCoin: не отримано токен WS"); return; }
+  const ep = tok.data.instanceServers?.[0]?.endpoint;
+  const url = `${ep}?token=${tok.data.token}`;
+  connect("KuCoin", url,
+    (ws) => {
+      KUCOIN_SYMBOLS.forEach((s, i) => {
+        setTimeout(() => { try {
+          ws.send(JSON.stringify({ id: Date.now() + i, type: "subscribe", topic: `/contractMarket/snapshot:${s}USDTM`, response: true }));
+        } catch {} }, i * 30);
+      });
+      setInterval(() => { try { ws.send(JSON.stringify({ id: Date.now(), type: "ping" })); } catch {} }, 15000);
+    },
+    (msg) => {
+      if (msg.topic?.includes("/contractMarket/snapshot") && msg.data?.data) {
+        const d = msg.data.data;
+        const symbol = (d.symbol || "").replace("USDTM", "");
+        const patch = { hasFutures: true, interval: 8 };
+        if (d.lastPrice != null) patch.price = parseFloat(d.lastPrice);
+        if (d.priceChgPct != null) patch.priceChange24h = parseFloat(d.priceChgPct) * 100;
+        if (d.turnover != null) patch.volume24h = parseFloat(d.turnover);
+        if (d.fundingFeeRate != null) patch.funding = parseFloat(d.fundingFeeRate) * 100;
+        setM("kucoin", symbol, patch);
+      }
+    }
+  );
+}
+
+// ── HTX (Huobi) ───────────────────────────────────────────────────────
+// HTX шле дані у gzip — потрібне розпакування
+function startHTX() {
+  let ws, stopped = false;
+  const open = () => {
+    if (stopped) return;
+    ws = new WebSocket("wss://api.hbdm.com/linear-swap-ws");
+    ws.on("open", () => {
+      console.log("🔌 HTX: підключено");
+      HTX_SYMBOLS.forEach((s) => {
+        try { ws.send(JSON.stringify({ sub: `market.${s}-USDT.detail`, id: s })); } catch {}
+      });
+    });
+    ws.on("message", (data) => {
+      try {
+        const txt = zlib.gunzipSync(data).toString();
+        const msg = JSON.parse(txt);
+        if (msg.ping) { ws.send(JSON.stringify({ pong: msg.ping })); return; }
+        if (msg.ch && msg.tick) {
+          const sym = msg.ch.split(".")[1]?.replace("-USDT", "");
+          setM("htx", sym, {
+            price: parseFloat(msg.tick.close),
+            volume24h: parseFloat(msg.tick.vol || 0),
+            hasFutures: true, interval: 8,
+          });
+        }
+      } catch {}
+    });
+    ws.on("close", () => { if (!stopped) { console.log("🔁 HTX: розрив, перепідключення за 5с"); setTimeout(open, 5000); } });
+    ws.on("error", (e) => { const m = e.message || ""; if (m.includes("451")) { stopped = true; console.log("⛔ HTX: блокування 451"); } else console.log(`❌ HTX: ${m}`); try { ws.close(); } catch {} });
+  };
+  open();
+}
+
+// ── BINGX ─────────────────────────────────────────────────────────────
+// BingX теж шле gzip
+function startBingX() {
+  let ws, stopped = false;
+  const open = () => {
+    if (stopped) return;
+    ws = new WebSocket("wss://open-api-swap.bingx.com/swap-market");
+    ws.on("open", () => {
+      console.log("🔌 BingX: підключено");
+      BINGX_SYMBOLS.forEach((s, i) => {
+        setTimeout(() => { try { ws.send(JSON.stringify({ id: String(Date.now() + i), reqType: "sub", dataType: `${s}-USDT@ticker` })); } catch {} }, i * 30);
+      });
+    });
+    ws.on("message", (data) => {
+      try {
+        const txt = zlib.gunzipSync(data).toString();
+        if (txt === "Ping") { ws.send("Pong"); return; }
+        const msg = JSON.parse(txt);
+        if (msg.dataType?.includes("@ticker") && msg.data) {
+          const d = msg.data;
+          const sym = (msg.dataType.split("-")[0]) || "";
+          setM("bingx", sym, {
+            price: parseFloat(d.c || d.lastPrice || 0),
+            priceChange24h: parseFloat(d.P || 0),
+            volume24h: parseFloat(d.q || 0),
+            hasFutures: true, interval: 8,
+          });
+        }
+      } catch {}
+    });
+    ws.on("close", () => { if (!stopped) { console.log("🔁 BingX: розрив, перепідключення за 5с"); setTimeout(open, 5000); } });
+    ws.on("error", (e) => { const m = e.message || ""; if (m.includes("451")) { stopped = true; console.log("⛔ BingX: блокування 451"); } else console.log(`❌ BingX: ${m}`); try { ws.close(); } catch {} });
+  };
+  open();
+}
+
 // ── СПИСКИ СИМВОЛІВ для бірж, що потребують підписки ───────────────────
 // (Binance шле все одразу; решта — лише на що підписались)
 const COMMON = ["BTC","ETH","SOL","BNB","XRP","DOGE","AVAX","LINK","ADA","TRX","DOT","LTC","BCH","NEAR",
@@ -675,6 +815,10 @@ const BYBIT_SYMBOLS = COMMON;
 const OKX_SYMBOLS = COMMON;
 const BITGET_SYMBOLS = COMMON;
 const GATE_SYMBOLS = COMMON;
+const MEXC_SYMBOLS = COMMON;
+const KUCOIN_SYMBOLS = COMMON;
+const HTX_SYMBOLS = COMMON;
+const BINGX_SYMBOLS = COMMON;
 
 // ═══════════════════════════════════════════════════════════════════
 //  REST-ЗАПИТИ ПРИ СТАРТІ (виконуються один раз):
@@ -746,9 +890,37 @@ async function loadGateMeta() {
   console.log(`   Gate: спот ${spotSets.gateio.size} пар`);
 }
 
+async function loadMexcMeta() {
+  const spot = await getJson("https://api.mexc.com/api/v3/exchangeInfo");
+  if (spot?.symbols) for (const s of spot.symbols)
+    if (s.quoteAsset === "USDT" && (s.status === "1" || s.status === "ENABLED" || s.isSpotTradingAllowed)) spotSets.mexc.add(s.baseAsset);
+  console.log(`   MEXC: спот ${spotSets.mexc.size} пар`);
+}
+async function loadKucoinMeta() {
+  const spot = await getJson("https://api.kucoin.com/api/v1/symbols");
+  if (spot?.data) for (const s of spot.data)
+    if (s.quoteCurrency === "USDT" && s.enableTrading) spotSets.kucoin.add(s.baseCurrency);
+  console.log(`   KuCoin: спот ${spotSets.kucoin.size} пар`);
+}
+async function loadHtxMeta() {
+  const spot = await getJson("https://api.huobi.pro/v2/settings/common/symbols");
+  if (spot?.data) for (const s of spot.data)
+    if (s.qcdn === "USDT" || s.quote_currency === "usdt") spotSets.htx.add((s.bcdn || s.base_currency || "").toUpperCase());
+  console.log(`   HTX: спот ${spotSets.htx.size} пар`);
+}
+async function loadBingxMeta() {
+  const spot = await getJson("https://open-api.bingx.com/openApi/spot/v1/common/symbols");
+  if (spot?.data?.symbols) for (const s of spot.data.symbols) {
+    const sym = (s.symbol || "");
+    if (sym.endsWith("-USDT")) spotSets.bingx.add(sym.replace("-USDT", ""));
+  }
+  console.log(`   BingX: спот ${spotSets.bingx.size} пар`);
+}
+
 const metaLoaders = {
   binance: loadBinanceMeta, bybit: loadBybitMeta, okx: loadOKXMeta,
   bitget: loadBitgetMeta, gateio: loadGateMeta,
+  mexc: loadMexcMeta, kucoin: loadKucoinMeta, htx: loadHtxMeta, bingx: loadBingxMeta,
 };
 
 async function loadAllMeta() {
@@ -774,7 +946,8 @@ function applyMeta() {
 console.log("🚀 Запуск FundingHunter Bot...");
 console.log("Біржі:", CONFIG.EXCHANGES.join(", "));
 
-const starters = { binance: startBinance, bybit: startBybit, okx: startOKX, bitget: startBitget, gateio: startGate };
+const starters = { binance: startBinance, bybit: startBybit, okx: startOKX, bitget: startBitget, gateio: startGate,
+  mexc: startMEXC, kucoin: startKucoin, htx: startHTX, bingx: startBingX };
 
 // Спочатку REST (списки спота + інтервали), потім WebSocket-стріми
 await loadAllMeta();
