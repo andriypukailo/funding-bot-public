@@ -44,7 +44,10 @@ export const CONFIG = {
   ALLOW_CROSS_EXCHANGE: true,
 
   // --- Які біржі вмикати ---
-  EXCHANGES: ["binance", "bybit", "okx", "bitget", "gateio"],
+  // ⚠️ Binance блокує IP-адреси Railway (помилка 451). На Railway він просто не дасть
+  // даних (бот це переживе, лише буде порожній). На VPS (Hetzner, Європа) — працює.
+  // Доступні: binance, bybit, okx, bitget, gateio, mexc, kucoin, htx, bingx
+  EXCHANGES: ["binance", "bybit", "okx", "bitget", "gateio", "mexc", "kucoin", "htx", "bingx"],
 
   // --- Як часто перевіряти умови (мілісекунди) ---
   CHECK_INTERVAL_MS: 15000,
