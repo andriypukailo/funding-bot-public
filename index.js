@@ -31,7 +31,9 @@ const DASHBOARD_HTML = `<!doctype html>
   .toolbar input{background:#070b12;border:1px solid #243042;border-radius:7px;color:#e2e8f0;padding:5px 9px;font-size:12px;width:90px}
   .toolbar button{background:#16202e;border:1px solid #243042;border-radius:7px;color:#cbd5e1;padding:5px 12px;font-size:12px;cursor:pointer}
   table{width:100%;border-collapse:collapse}
-  th{padding:9px 11px;font-size:10.5px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.05em;text-align:right;white-space:nowrap;border-bottom:1px solid #16202e}
+  th{padding:9px 11px;font-size:10.5px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.05em;text-align:right;white-space:nowrap;border-bottom:1px solid #16202e;cursor:pointer;user-select:none}
+  th:hover{color:#94a3b8}
+  th.active{color:#f59e0b}
   th.l,td.l{text-align:left}
   td{padding:8px 11px;font-size:12.5px;text-align:right;border-bottom:1px solid #111a26;font-variant-numeric:tabular-nums}
   tr.sig{background:#1c1605}
@@ -69,18 +71,18 @@ const DASHBOARD_HTML = `<!doctype html>
   </div>
   <div class="scroll">
     <table>
-      <thead><tr>
-        <th class="l">Актив</th><th class="l">Біржа</th><th>Ціна</th>
-        <th>Фандінг</th><th style="color:#fbbf24">Нетто</th><th style="color:#94a3b8">Крос-витр.</th>
-        <th class="l">Як торгувати</th><th>Інт.</th><th>До виплати</th>
-        <th>Ціна 24г</th><th>Обсяг</th><th>OI</th>
+      <thead><tr id="hrow">
+        <th class="l" data-k="sym">Актив</th><th class="l" data-k="ex">Біржа</th><th data-k="price">Ціна</th>
+        <th data-k="funding">Фандінг</th><th data-k="net" style="color:#fbbf24">Нетто</th><th data-k="cross" style="color:#94a3b8">Крос-витр.</th>
+        <th class="l" data-k="plan">Як торгувати</th><th data-k="interval">Інт.</th><th data-k="mins">До виплати</th>
+        <th data-k="priceChange24h">Ціна 24г</th><th data-k="volume24h">Обсяг</th><th data-k="oi">OI</th>
       </tr></thead>
       <tbody id="tb"></tbody>
     </table>
   </div>
 </div>
 <script>
-let CFG=null, RAW=[], SHOW_ALL=false;
+let CFG=null, RAW=[], SHOW_ALL=false, SORT_KEY=null, SORT_DIR=-1;
 const fmtUsd=n=>n==null?'—':n>=1e9?'$'+(n/1e9).toFixed(2)+'B':n>=1e6?'$'+(n/1e6).toFixed(1)+'M':n>=1e3?'$'+(n/1e3).toFixed(0)+'K':'$'+n.toFixed(0);
 const fmtPct=n=>n==null?'—':(n>=0?'+':'')+n.toFixed(3)+'%';
 const fmtPrice=n=>n==null?'—':n>=1000?'$'+n.toLocaleString('en-US',{maximumFractionDigits:1}):n>=1?'$'+n.toFixed(3):'$'+n.toFixed(6);
@@ -127,6 +129,28 @@ function getF(){return{
   price:parseFloat(document.getElementById('fPrice').value),
   both:document.getElementById('fBoth').checked,
 };}
+function updateHeaderArrows(){
+  document.querySelectorAll('#hrow th').forEach(th=>{
+    const k=th.getAttribute('data-k');
+    th.classList.toggle('active',k===SORT_KEY);
+    const base=th.textContent.replace(/[▲▼]\s*$/,'').trim();
+    if(k===SORT_KEY)th.textContent=base+' '+(SORT_DIR===1?'▲':'▼');
+    else th.textContent=base;
+  });
+}
+function setupSort(){
+  document.querySelectorAll('#hrow th').forEach(th=>{
+    th.addEventListener('click',()=>{
+      const k=th.getAttribute('data-k');
+      if(SORT_KEY===k){
+        if(SORT_DIR===-1)SORT_DIR=1;          // спадання -> зростання
+        else {SORT_KEY=null;SORT_DIR=-1;}     // зростання -> вимкнути (дефолт)
+      } else {SORT_KEY=k;SORT_DIR=-1;}        // нова колонка: спочатку спадання
+      updateHeaderArrows();
+      render();
+    });
+  });
+}
 function applyClient(){render();}
 function toggleAll(){
   SHOW_ALL=!SHOW_ALL;
@@ -136,12 +160,14 @@ function toggleAll(){
 }
 function resetClient(){
   SHOW_ALL=false;
+  SORT_KEY=null;SORT_DIR=-1;
   document.getElementById('allBtn').textContent='Показати всі';
   document.getElementById('allBtn').style.background='#16202e';
   document.getElementById('fMin').value=CFG.minNet;
   document.getElementById('fMax').value=CFG.maxNet;
   document.getElementById('fPrice').value=CFG.maxPrice;
   document.getElementById('fBoth').checked=CFG.requireBoth;
+  updateHeaderArrows();
   render();
 }
 function render(){
@@ -164,7 +190,24 @@ function render(){
   // ВАЖЛИВО: вікно часу тут НЕ фільтрує — лише підсвічує (жовтим).
   // Сигнал у Telegram (з умовою ≤ вікно хв) обробляється окремо на бекенді.
   const sig=r=>r.mins!=null&&r.mins>=0&&r.mins<=CFG.window;
-  rows.sort((a,b)=>{const sa=sig(a),sb=sig(b);if(sa!==sb)return sa?-1:1;if(sa&&sb)return a.mins-b.mins;return b.net-a.net;});
+  if(SORT_KEY){
+    // користувач обрав колонку — сортуємо тільки по ній
+    const k=SORT_KEY, dir=SORT_DIR;
+    const val=(r)=>{
+      if(k==='sym'||k==='ex')return r[k]||'';
+      if(k==='cross')return r.cross?1:0;
+      if(k==='plan')return r.funding>=0?1:-1; // приблизно: напрям угоди
+      const v=r[k];return v==null?-Infinity:v;
+    };
+    rows.sort((a,b)=>{
+      const va=val(a),vb=val(b);
+      if(typeof va==='string')return dir*va.localeCompare(vb);
+      return dir*(va-vb);
+    });
+  } else {
+    // за замовчуванням: сигнали зверху, потім за нетто
+    rows.sort((a,b)=>{const sa=sig(a),sb=sig(b);if(sa!==sb)return sa?-1:1;if(sa&&sb)return a.mins-b.mins;return b.net-a.net;});
+  }
   const sc=rows.filter(sig).length;
   document.getElementById('sigcount').textContent='● '+sc+' сигналів';
   document.getElementById('sigcount').style.color=sc?'#fde047':'#475569';
@@ -199,7 +242,7 @@ function render(){
       '<td>'+fmtUsd(r.oi)+'</td></tr>';
   }).join('')||'<tr><td colspan="12" style="text-align:center;padding:40px;color:#475569">Немає пар за фільтрами. Натисніть «Показати всі», щоб побачити геть усі котирування з бірж (екстремальний фандінг 1–4% буває нечасто).</td></tr>';
 }
-load(); setInterval(load,10000);
+load(); setupSort(); setInterval(load,10000);
 </script>
 </body></html>`;
 
